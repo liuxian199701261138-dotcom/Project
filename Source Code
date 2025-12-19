@@ -1,0 +1,239 @@
+# ========================================
+# Install dependencies (if needed)
+
+# ========================================
+# !pip install geopandas pysal censusdata requests matplotlib shapely folium
+
+# ========================================
+# Imports
+# ========================================
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import Point
+import matplotlib.pyplot as plt
+from pysal.explore import esda
+from pysal.lib import weights
+from pysal.model import spreg
+import requests
+from libpysal.weights import Queen
+from esda.moran import Moran
+import numpy as np
+from esda.moran import Moran_BV
+
+
+plt.style.use('seaborn-v0_8')
+
+# ========================================
+# Load NYC Crash Data
+# ========================================
+crash_url = "/Users/aidenpearce/Desktop/Project/Motor_Vehicle_Collisions_-_Crashes_20251104.csv"
+crashes = pd.read_csv(crash_url)
+
+# Keep only valid coordinates
+crashes = crashes.dropna(subset=["LATITUDE", "LONGITUDE"])
+geometry = [Point(xy) for xy in zip(crashes.LONGITUDE, crashes.LATITUDE)]
+crash_gdf = gpd.GeoDataFrame(crashes, geometry=geometry, crs="EPSG:4326")
+
+# ========================================
+# Load NYC Census Tracts (Spatial Polygons)
+# ========================================
+tracts_url = "/Users/aidenpearce/Desktop/Project/tl_2022_36_tract"
+tracts = gpd.read_file(tracts_url)
+tracts = tracts.to_crs("EPSG:4326")
+
+# Extract tract GEOID (needed for Census API merge)
+tracts["geoid"] = tracts["GEOID"]
+
+# ========================================
+# Get Real Population Data from U.S. Census API
+# ========================================
+# Source: 2023 ACS 5-Year Estimates, Table B01003 = Total Population
+# Documentation: https://api.census.gov/data.html
+
+api_url = "https://api.census.gov/data/2023/acs/acs5"
+params = {
+    "get": "B01003_001E",
+    "for": "tract:*",
+    "in": "state:36 county:005,047,061,081,085"  # NYC counties: Bronx, Brooklyn, Manhattan, Queens, Staten Island
+}
+
+response = requests.get(api_url, params=params)
+data = response.json()
+
+# Convert to DataFrame
+cols = data[0]
+pop_df = pd.DataFrame(data[1:], columns=cols)
+pop_df["geoid"] = pop_df["state"] + pop_df["county"] + pop_df["tract"]
+pop_df["population"] = pop_df["B01003_001E"].astype(float)
+pop_df = pop_df[["geoid", "population"]]
+
+# ========================================
+# Merge Population with Tracts
+# ========================================
+tracts = tracts.merge(pop_df, on="geoid", how="left")
+tracts = tracts.to_crs(epsg=2263)
+tracts["area_km2"] = tracts.geometry.area / 10**6
+tracts["pop_density"] = tracts["population"] / tracts["area_km2"]
+
+# ========================================
+# Spatial Join: Crashes → Tracts
+# ========================================
+crash_gdf = crash_gdf.to_crs(tracts.crs)
+crashes_in_tract = gpd.sjoin(crash_gdf, tracts, how="inner", predicate="within")
+crash_counts = crashes_in_tract.groupby("geoid").size().reset_index(name="crash_count")
+
+# Merge counts back to tracts
+tracts = tracts.merge(crash_counts, on="geoid", how="left").fillna({"crash_count": 0})
+
+# ========================================
+# Hotspot Analysis (Getis-Ord Gi*)
+# ========================================
+tracts = tracts.to_crs(epsg=4326)
+w = weights.KNN.from_dataframe(tracts, k=8)
+g_local = esda.getisord.G_Local(tracts["crash_count"], w)
+tracts["GiZScore"] = g_local.Zs
+tracts["GiPValue"] = g_local.p_sim
+
+# ========================================
+# Spatial Correlation (Moran’s I)
+# ========================================
+w_queen = weights.Queen.from_dataframe(tracts)
+moran = esda.Moran(tracts["crash_count"], w_queen)
+print(f"Moran’s I: {moran.I:.3f}")
+print(f"P-value: {moran.p_sim:.4f}")
+
+# ========================================
+# Bivariate Moran’s I (Crash Count vs Pop Density)
+# ========================================
+bv = esda.moran.Moran_BV(tracts["crash_count"], tracts["pop_density"], w_queen)
+print(f"Bivariate Moran’s I: {bv.I:.3f}")
+print(f"P-value: {bv.p_sim:.4f}")
+
+# ========================================
+#  Spatial Regression (Optional)
+# ========================================
+X = tracts[["pop_density"]].fillna(0).values
+y = tracts["crash_count"].values.reshape(-1, 1)
+w_queen.transform = "r"
+
+model = spreg.ML_Lag(y, X, w=w_queen, name_y="Crashes", name_x=["PopDensity"])
+print(model.summary)
+
+# ========================================
+# Visualization
+# ========================================
+fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+tracts.plot(column="GiZScore", cmap="RdYlBu", legend=True, ax=ax)
+ax.set_title("NYC Crash Hotspots (Getis-Ord Gi*)", fontsize=14)
+ax.axis("off")
+plt.show()
+
+fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+tracts.plot(column="pop_density", cmap="viridis", legend=True, ax=ax)
+ax.set_title("Population Density by Census Tract (people/km²)", fontsize=14)
+ax.axis("off")
+plt.show()
+
+
+crashes_per_1000 = tracts["crashes_per_1000"] = (tracts["crash_count"] / tracts["population"]) * 1000
+tracts["log_crash_rate"] = np.log1p(tracts["crashes_per_1000"])
+moran = Moran(tracts["log_crash_rate"], w)
+
+
+tracts = tracts[(tracts["crashes_per_1000"] > 0) &(tracts["population"] > 0)].copy()
+tracts = tracts.to_crs("EPSG:2263")  # NY State Plane (meters)
+tracts["pop_density"] = (tracts["population"] / (tracts.geometry.area / 1e6)) # per km²
+tracts["log_crash_rate"] = np.log1p(tracts["crashes_per_1000"])
+tracts["log_pop_density"] = np.log1p(tracts["pop_density"])
+tracts = tracts.replace([np.inf, -np.inf], np.nan)
+tracts = tracts.dropna(subset=["log_crash_rate", "log_pop_density"])
+w = Queen.from_dataframe(tracts)
+w.transform = "r"
+moran_bv = Moran_BV(tracts["log_crash_rate"].values,tracts["log_pop_density"].values,w)
+
+print("Bivariate Moran’s I:", moran_bv.I)
+print("p-value:", moran_bv.p_sim)
+print(moran.I, moran.p_sim)
+plt.figure(figsize=(8,6))
+plt.scatter(tracts["pop_density"], tracts["crash_count"], alpha=0.6)
+plt.xlabel("Population Density (per km²)")
+plt.ylabel("Crash Count")
+plt.title("Crash Count vs Population Density")
+plt.show()
+
+#building prediction model
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import classification_report, roc_auc_score
+from libpysal.weights import lag_spatial
+from sklearn.ensemble import RandomForestClassifier
+
+threshold = tracts["crashes_per_1000"].quantile(0.75)
+tracts["high_risk"] = (tracts["crashes_per_1000"] >= threshold).astype(int)
+w = Queen.from_dataframe(tracts)
+w.transform = "R"
+
+tracts["lag_log_crash_rate"] = lag_spatial(w, tracts["log_crash_rate"])
+tracts["lag_log_pop_density"] = lag_spatial(w, tracts["log_pop_density"])
+
+features = [
+    "log_crash_rate",
+    "log_pop_density",
+    "population",
+    "area_km2",
+    "lag_log_crash_rate",
+    "lag_log_pop_density"
+]
+
+data = tracts.dropna(subset=features + ["high_risk"])
+X = data[features]
+y = data["high_risk"]
+
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=0.3,
+    random_state=42,
+    stratify=y
+)
+
+
+rf = RandomForestClassifier(
+    n_estimators=300,
+    max_depth=10,
+    min_samples_leaf=10,
+    random_state=42
+)
+
+rf.fit(X_train, y_train)
+
+y_pred_rf = rf.predict(X_test)
+y_prob_rf = rf.predict_proba(X_test)[:, 1]
+
+print(classification_report(y_test, y_pred_rf))
+print("ROC-AUC:", roc_auc_score(y_test, y_prob_rf))
+
+model=rf
+
+tracts["predicted_risk"] = model.predict_proba(
+    tracts[features].fillna(tracts[features].fillna(0))
+)[:, 1]
+
+importances = pd.Series(
+    rf.feature_importances_,
+    index=features
+).sort_values(ascending=False)
+
+print(importances)
+
+tracts.plot(
+    column="predicted_risk",
+    cmap="Reds",
+    legend=True,
+    figsize=(10, 10)
+)
+
+moran = Moran(tracts["predicted_risk"], w)
+print("Moran’s I:", moran.I)
+print("p-value:", moran.p_sim)
