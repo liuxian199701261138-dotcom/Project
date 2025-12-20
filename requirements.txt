@@ -1,0 +1,25 @@
+# Core data handling
+pandas>=1.5
+numpy>=1.23
+
+# Geospatial analysis
+geopandas>=0.13
+shapely>=2.0
+pyproj>=3.5
+fiona>=1.9
+pyogrio>=0.6
+
+# Spatial statistics
+libpysal>=4.8
+esda>=2.5
+
+# Machine learning
+scikit-learn>=1.2
+
+# Visualization
+matplotlib>=3.7
+seaborn>=0.12
+
+# Notebook support
+jupyterlab>=4.0
+ipykernel>=6.0
